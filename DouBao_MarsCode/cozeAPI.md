@@ -4,7 +4,7 @@
 
 ### 1.1 认证信息
 ```python
-api_key = "pat_By3t8bKtq827xOKDg6xbRcPezf7zzQ1bUrpIfb3KwhnOmagtRFSRJprgGlMFJdU3"
+api_key = ""
 bot_id = "7445600453913968691"
 base_url = "https://api.coze.cn/v3"
 ```

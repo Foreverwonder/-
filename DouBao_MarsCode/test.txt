@@ -1,0 +1,924 @@
+import requests
+import json
+import time
+import os
+import mimetypes
+import tkinter as tk
+from tkinter import ttk, scrolledtext, filedialog, messagebox
+from PIL import Image, ImageTk
+import threading
+from ttkthemes import ThemedTk
+import emoji
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    # 如果没有安装 tkinterdnd2，禁用拖放功能
+    DND_FILES = None
+    TkinterDnD = None
+
+class ModernUI:
+    # 深色主题配色
+    DARK_THEME = {
+        'bg': '#1e1e1e',           # 更深的背景色
+        'fg': '#ffffff',           # 白色文字
+        'input_bg': '#2d2d2d',     # 输入框背景
+        'button_bg': '#0078d4',    # 微软蓝按钮
+        'button_fg': '#ffffff',    # 按钮文字颜色
+        'highlight': '#0078d4',    # 高亮颜色
+        'border': '#3d3d3d',       # 边框颜色
+        'hover': '#106ebe'         # 悬停颜色
+    }
+    
+    # 浅色主题配色
+    LIGHT_THEME = {
+        'bg': '#ffffff',           # 纯白背景
+        'fg': '#2c2c2c',           # 深灰文字
+        'input_bg': '#f5f5f5',     # 浅灰输入框
+        'button_bg': '#0078d4',    # 微软蓝按钮
+        'button_fg': '#ffffff',    # 按钮文字颜色
+        'highlight': '#0078d4',    # 高亮颜色
+        'border': '#e0e0e0',       # 边框颜色
+        'hover': '#106ebe'         # 悬停颜色
+    }
+
+class CozeAPI:
+    # 支持的文件类型
+    SUPPORTED_DOCUMENTS = {
+        '.doc': 'application/msword',
+        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        '.xls': 'application/vnd.ms-excel',
+        '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        '.ppt': 'application/vnd.ms-powerpoint',
+        '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        '.pdf': 'application/pdf',
+        '.numbers': 'application/x-iwork-numbers-sffnumbers',
+        '.csv': 'text/csv'
+    }
+    
+    SUPPORTED_IMAGES = {
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.jpg2': 'image/jpeg2000',
+        '.png': 'image/png',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+        '.heic': 'image/heic',
+        '.heif': 'image/heif',
+        '.bmp': 'image/bmp',
+        '.pcd': 'image/x-photo-cd',
+        '.tiff': 'image/tiff',
+        '.tif': 'image/tiff'
+    }
+
+    def __init__(self, auth_token):
+        # 验证token
+        if not auth_token or len(auth_token) < 10:
+            raise ValueError("无效的认证令牌")
+            
+        self.base_url = "https://api.coze.cn/v3"
+        self.upload_url = "https://api.coze.cn/v1/files/upload"
+        self.auth_token = auth_token
+        self.headers = {
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json"
+        }
+        
+        # 配置重试策略
+        retry_strategy = requests.adapters.Retry(
+            total=5,  # 总重试次数
+            backoff_factor=0.5,  # 重试间隔
+            status_forcelist=[500, 502, 503, 504],  # 需要重试的HTTP状态码
+            allowed_methods=["GET", "POST"]  # 允许重试的请求方法
+        )
+        
+        # 创建带有重试策略的session
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        self.session.headers.update(self.headers)
+        
+        # 添加请求控制
+        self.last_request_time = 0
+        self.min_request_interval = 0.5  # 最小请求间隔(秒)
+        
+    def _wait_for_rate_limit(self):
+        """控制请求频率"""
+        current_time = time.time()
+        time_since_last_request = current_time - self.last_request_time
+        if time_since_last_request < self.min_request_interval:
+            time.sleep(self.min_request_interval - time_since_last_request)
+        self.last_request_time = time.time()
+
+    def get_file_type(self, file_path):
+        """获取文件类型和MIME类型"""
+        ext = os.path.splitext(file_path)[1].lower()
+        
+        if ext in self.SUPPORTED_DOCUMENTS:
+            return 'document', self.SUPPORTED_DOCUMENTS[ext]
+        elif ext in self.SUPPORTED_IMAGES:
+            return 'image', self.SUPPORTED_IMAGES[ext]
+        else:
+            supported_formats = list(self.SUPPORTED_DOCUMENTS.keys()) + list(self.SUPPORTED_IMAGES.keys())
+            raise ValueError(f"不支持的文件类型: {ext}。支持的格式: {', '.join(supported_formats)}")
+
+    def upload_file(self, file_path, timeout=30):
+        """上传文件到服务器"""
+        # 控制请求频率
+        self._wait_for_rate_limit()
+        
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"文件不存在: {file_path}")
+            
+        # 检查文件大小
+        file_size = os.path.getsize(file_path)
+        if file_size > 512 * 1024 * 1024:  # 512 MB
+            raise ValueError(f"文件大小超过限制（512MB）：当前大小 {file_size / 1024 / 1024:.2f}MB")
+            
+        # 获取文件类型
+        file_type, mime_type = self.get_file_type(file_path)
+        
+        # 设置上传文件的headers（注意：这里不需要Content-Type）
+        headers = {
+            "Authorization": f"Bearer {self.auth_token}"
+        }
+        
+        # 准备文件
+        try:
+            with open(file_path, 'rb') as file:
+                files = {
+                    'file': (
+                        os.path.basename(file_path),  # 文件名
+                        file,                         # 文件对象
+                        mime_type                     # MIME类型
+                    )
+                }
+                
+                print(f"\n正在上传{file_type}: {os.path.basename(file_path)}")
+                print(f"文件类型: {mime_type}")
+                print(f"文件大小: {file_size / 1024 / 1024:.2f}MB")
+                
+                # 使用session进行上传
+                response = self.session.post(
+                    self.upload_url,
+                    headers=headers,
+                    files=files,
+                    timeout=timeout
+                )
+                
+                # 检查HTTP状态码
+                response.raise_for_status()
+                
+                try:
+                    result = response.json()
+                except json.JSONDecodeError as e:
+                    print(f"JSON解析错误: {str(e)}")
+                    print(f"响应内容: {response.text}")
+                    raise Exception("文件上传响应格式错误")
+                
+                # 检查API错误码
+                if result.get("code") != 0:
+                    error_msg = result.get("msg", "未知错误")
+                    error_code = result.get("code", -1)
+                    raise Exception(f"文件上传失败 (代码: {error_code}): {error_msg}")
+                
+                # 验证响应数据
+                if "data" not in result or not isinstance(result["data"], dict):
+                    raise Exception(f"文件上传响应数据格式错误: {result}")
+                
+                file_id = result["data"].get("id")
+                if not file_id:
+                    raise Exception("响应中没有文件ID")
+                
+                print(f"{file_type}上传成功！ID: {file_id}")
+                return file_id, file_type
+                    
+        except requests.exceptions.RequestException as e:
+            print(f"请求错误: {str(e)}")
+            raise Exception(f"文件上传请求失败: {str(e)}")
+        except Exception as e:
+            print(f"文件上传出错: {str(e)}")
+            raise
+
+    def send_message(self, bot_id, user_id, message, user_name="User", file_path=None):
+        # 控制请求频率
+        self._wait_for_rate_limit()
+        
+        try:
+            # 如果提供了文件路径，先上传文件
+            file_id = None
+            file_type = None
+            if file_path:
+                try:
+                    file_id, file_type = self.upload_file(file_path)
+                except Exception as e:
+                    print(f"文件上传失败: {str(e)}")
+                    # 如果文件上传失败，继续发送文本消息
+                    pass
+
+            # 准备消息内容
+            messages = []
+            
+            # 添加文本消息（必须在前面）
+            messages.append({
+                "content_type": "text",
+                "content": message,
+                "role": "user",
+                "name": user_name,
+                "type": "question"
+            })
+            
+            # 如果有文件，添加文件消息
+            if file_id:
+                file_content = {
+                    "type": file_type,
+                    "file_id": file_id,
+                    "url": None  # 上传时不需要URL
+                }
+                messages.append({
+                    "content_type": "object_string",
+                    "content": json.dumps([file_content]),
+                    "role": "user",
+                    "name": user_name,
+                    "type": "question"
+                })
+
+            payload = {
+                "bot_id": bot_id,
+                "user_id": user_id,
+                "additional_messages": messages
+            }
+
+            print("\n发送请求:")
+            print(f"URL: {self.base_url}/chat")
+            print("Payload:", json.dumps(payload, ensure_ascii=False, indent=2))
+            
+            # 发送请求
+            response = self.session.post(
+                f"{self.base_url}/chat",
+                json=payload,
+                timeout=30  # 添加超时设置
+            )
+            
+            print(f"\n响应状态码: {response.status_code}")
+            print("响应头:", dict(response.headers))
+            
+            # 检查HTTP状态码
+            response.raise_for_status()
+            
+            try:
+                data = response.json()
+                print("\n响应内容:", json.dumps(data, ensure_ascii=False, indent=2))
+            except json.JSONDecodeError as e:
+                print(f"JSON解析错误: {str(e)}")
+                print(f"原始响应内容: {response.text}")
+                raise Exception("API响应格式错误")
+            
+            # 处理API错误码
+            if data.get("code") != 0:
+                error_msg = data.get("msg", "未知错误")
+                error_code = data.get("code", -1)
+                raise Exception(f"API错误 (代码: {error_code}): {error_msg}")
+            
+            if "data" not in data or not isinstance(data.get("data"), dict):
+                raise Exception(f"API 返回数据格式错误: {data}")
+
+            chat_id = data["data"]["id"]
+            conversation_id = data["data"]["conversation_id"]
+            
+            print(f"\n开始等待回复 (chat_id: {chat_id}, conversation_id: {conversation_id})")
+            
+            # 等待完成
+            max_wait_time = 60  # 最大等待时间（秒）
+            start_time = time.time()
+            
+            while True:
+                if time.time() - start_time > max_wait_time:
+                    raise Exception(f"等待响应超时 ({max_wait_time}秒)")
+                    
+                status = self.check_status(conversation_id, chat_id)
+                print("\n状态检查响应:", json.dumps(status, ensure_ascii=False, indent=2))
+                
+                # 检查状态响应的错误码
+                if status.get("code") != 0:
+                    error_msg = status.get("msg", "未知错误")
+                    error_code = status.get("code", -1)
+                    raise Exception(f"状态检查失败 (代码: {error_code}): {error_msg}")
+                    
+                if status["data"]["status"] == "completed":
+                    print("\n回复已完成")
+                    break
+                    
+                time.sleep(1)
+            
+            # 获取消息列表
+            print("\n获取消息列表...")
+            messages = self.get_messages(conversation_id, chat_id)
+            
+            # 检查消息列表响应的错误码
+            if messages.get("code") != 0:
+                error_msg = messages.get("msg", "未知错误")
+                error_code = messages.get("code", -1)
+                raise Exception(f"获取消息失败 (代码: {error_code}): {error_msg}")
+                
+            return messages
+            
+        except requests.exceptions.Timeout:
+            raise Exception("请求超时")
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"网络请求错误: {str(e)}")
+        except Exception as e:
+            print(f"发送消息时出错: {str(e)}")
+            import traceback
+            print("详细错误信息:")
+            print(traceback.format_exc())
+            raise
+
+    def check_status(self, conversation_id, chat_id):
+        url = f"{self.base_url}/chat/retrieve"
+        params = {
+            "conversation_id": conversation_id,
+            "chat_id": chat_id
+        }
+        response = self.session.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
+
+    def get_messages(self, conversation_id, chat_id):
+        url = f"{self.base_url}/chat/message/list"
+        params = {
+            "conversation_id": conversation_id,
+            "chat_id": chat_id
+        }
+        response = self.session.get(url, params=params)
+        response.raise_for_status()
+        result = response.json()
+        
+        # 添加调试信息
+        print("\n获取消息响应:", json.dumps(result, ensure_ascii=False, indent=2))
+        return result
+
+class CozeGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("AI 智能助手")
+        self.root.geometry("1000x700")
+        
+        # 设置主题
+        self.current_theme = ModernUI.LIGHT_THEME
+        self.setup_theme()
+        
+        # 创建 CozeAPI 实例
+        self.api = CozeAPI("pat_RZYft8z3yYWsykY49qZJjTwMyWN8uOzq652JPmTrfnNW4f9QhGx9VwaW81FPU6kP")
+        self.selected_file = None
+        self.user_id = None
+        self.last_message = None
+        self.last_user_id = None
+        
+        self.create_widgets()
+        self.bind_shortcuts()
+        
+    def setup_theme(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        # 配置主题颜色
+        style.configure('Modern.TFrame', background=self.current_theme['bg'])
+        
+        # 主按钮样式
+        style.configure('Modern.TButton', 
+                       padding=(15, 8),
+                       background=self.current_theme['button_bg'],
+                       foreground=self.current_theme['button_fg'],
+                       font=('Helvetica', 10))
+        
+        # 图标按钮样式
+        style.configure('Icon.TButton',
+                       padding=(5, 5),
+                       background=self.current_theme['button_bg'],
+                       foreground=self.current_theme['button_fg'],
+                       font=('Helvetica', 12))
+        
+        # Label样式
+        style.configure('Modern.TLabel',
+                       background=self.current_theme['bg'],
+                       foreground=self.current_theme['fg'],
+                       font=('Helvetica', 10))
+        
+        # 输入框样式
+        style.configure('Chat.TEntry',
+                       fieldbackground=self.current_theme['input_bg'],
+                       foreground=self.current_theme['fg'],
+                       insertcolor=self.current_theme['fg'])
+        
+        # 添加状态标签样式
+        style.configure('Status.TLabel',
+                       background=self.current_theme['bg'],
+                       foreground='#666666',  # 使用柔和的灰色
+                       font=('Helvetica', 9, 'italic'))  # 使用斜体小字号
+
+    def create_widgets(self):
+        # 创建主框架
+        self.main_frame = ttk.Frame(self.root, style='Modern.TFrame', padding="10")
+        self.main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # 创建顶部工具栏
+        self.create_toolbar()
+        
+        # 创建聊天区域
+        self.create_chat_area()
+        
+        # 创建输入区域
+        self.create_input_area()
+        
+        # 配置grid权重
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        self.main_frame.grid_rowconfigure(2, weight=1)
+        self.main_frame.grid_columnconfigure(0, weight=1)
+        
+    def create_toolbar(self):
+        toolbar = ttk.Frame(self.main_frame, style='Modern.TFrame')
+        toolbar.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # 隐藏用户ID，改用时间戳自动生成
+        self.user_id = f"user_{int(time.time())}"
+        
+        # 右侧按钮组
+        btn_frame = ttk.Frame(toolbar, style='Modern.TFrame')
+        btn_frame.pack(side=tk.RIGHT)
+        
+        # 主题切换按钮
+        self.theme_btn = ttk.Button(btn_frame, text="☀️", width=3,
+                                  command=self.toggle_theme, style='Icon.TButton')
+        self.theme_btn.pack(side=tk.RIGHT, padx=5)
+        
+        # 清除历史按钮
+        self.clear_btn = ttk.Button(btn_frame, text="🗑️", width=3,
+                                  command=self.clear_history, style='Icon.TButton')
+        self.clear_btn.pack(side=tk.RIGHT, padx=5)
+        
+    def create_chat_area(self):
+        # 聊天显示区域
+        self.chat_display = scrolledtext.ScrolledText(
+            self.main_frame, 
+            wrap=tk.WORD, 
+            width=70, 
+            height=20,
+            font=('Helvetica', 10),
+            bg=self.current_theme['input_bg'],
+            fg=self.current_theme['fg'],
+            insertbackground=self.current_theme['fg'],
+            relief="flat",
+            padx=15,
+            pady=10
+        )
+        self.chat_display.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
+        
+        # 配置消息样式
+        self.chat_display.tag_configure('user', 
+                                      foreground='#0078d4',
+                                      font=('Helvetica', 10, 'bold'))
+        self.chat_display.tag_configure('bot', 
+                                      foreground='#28a745',
+                                      font=('Helvetica', 10, 'bold'))
+        self.chat_display.tag_configure('message',
+                                      font=('Helvetica', 10))
+        self.chat_display.tag_configure('suggestion', 
+                                      foreground='#6c757d',
+                                      font=('Helvetica', 10, 'italic'),
+                                      underline=True)
+        # 使文本框只读
+        self.chat_display.bind("<Key>", lambda e: "break")
+        
+    def create_input_area(self):
+        input_frame = ttk.Frame(self.main_frame, style='Modern.TFrame')
+        input_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(5, 0))
+        
+        # 文件拖放区域
+        drop_text = "拖放文件到这里 或 点击选择" if TkinterDnD else "点击选择文件"
+        self.drop_label = ttk.Label(
+            input_frame, 
+            text=drop_text,
+            style='Modern.TLabel',
+            cursor="hand2"  # 添加手型光标
+        )
+        self.drop_label.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+        self.drop_label.bind('<Button-1>', lambda e: self.select_file())
+        
+        # 消息输入框
+        self.message_input = scrolledtext.ScrolledText(
+            input_frame, 
+            wrap=tk.WORD, 
+            width=50, 
+            height=3,
+            font=('Helvetica', 10),
+            bg=self.current_theme['input_bg'],
+            fg=self.current_theme['fg'],
+            insertbackground=self.current_theme['fg'],  # 光标颜色
+            relief="flat",  # 扁平化设计
+            padx=10,  # 内边距
+            pady=5
+        )
+        self.message_input.grid(row=1, column=0, padx=5, pady=5, sticky=(tk.W, tk.E))
+        
+        # 发送按钮
+        self.send_btn = ttk.Button(input_frame, text="发送", 
+                                 command=self.send_message, style='Modern.TButton')
+        self.send_btn.grid(row=1, column=1, padx=5, pady=5)
+        
+        # 文件名显示
+        self.file_label = ttk.Label(input_frame, text="", style='Modern.TLabel')
+        self.file_label.grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=5)
+        
+        # 配置列权重
+        input_frame.grid_columnconfigure(0, weight=1)
+        
+    def bind_shortcuts(self):
+        # 绑定快捷键
+        self.root.bind('<Control-Return>', lambda e: self.send_message())
+        self.root.bind('<Control-l>', lambda e: self.clear_history())
+        
+        # 只在持拖放时添加拖放功能
+        if TkinterDnD:
+            self.drop_label.drop_target_register(DND_FILES)
+            self.drop_label.dnd_bind('<<Drop>>', self.handle_drop)
+            self.message_input.drop_target_register(DND_FILES)
+            self.message_input.dnd_bind('<<Drop>>', self.handle_drop)
+        
+    def toggle_theme(self):
+        # 切换主题
+        self.current_theme = (ModernUI.DARK_THEME 
+                            if self.current_theme == ModernUI.LIGHT_THEME 
+                            else ModernUI.LIGHT_THEME)
+        self.setup_theme()
+        self.update_colors()
+        
+    def clear_history(self):
+        if messagebox.askyesno("确认", "确定要清除所有聊天历史吗？"):
+            self.chat_display.delete(1.0, tk.END)
+            
+    def show_emoji_picker(self):
+        # 创建表情选择窗口
+        emoji_window = tk.Toplevel(self.root)
+        emoji_window.title("选择表情")
+        emoji_window.geometry("200x200")
+        
+        common_emojis = ['😊', '😂', '🤔', '👍', '❤️', '😎', '', '✨']
+        for i, emoji_char in enumerate(common_emojis):
+            btn = ttk.Button(
+                emoji_window, 
+                text=emoji_char,
+                command=lambda e=emoji_char: self.insert_emoji(e, emoji_window)
+            )
+            btn.grid(row=i//4, column=i%4, padx=5, pady=5)
+            
+    def insert_emoji(self, emoji_char, window):
+        self.message_input.insert(tk.INSERT, emoji_char)
+        window.destroy()
+        
+    def handle_drop(self, event):
+        file_path = event.data
+        if file_path:
+            self.selected_file = file_path
+            self.file_label.config(text=f"已选择: {os.path.basename(file_path)}")
+            
+    def update_colors(self):
+        # 更新各个组件的颜色
+        self.chat_display.configure(
+            bg=self.current_theme['input_bg'],
+            fg=self.current_theme['fg']
+        )
+        self.message_input.configure(
+            bg=self.current_theme['input_bg'],
+            fg=self.current_theme['fg']
+        )
+        
+    def show_sending_status(self):
+        self.update_status("正在发送...")
+
+    def hide_sending_status(self):
+        if hasattr(self, 'status_label'):
+            self.status_label.destroy()
+
+    def select_file(self):
+        file_types = [
+            ("所有支持的文件", "*.png *.jpg *.jpeg *.gif *.pdf *.doc *.docx *.xls *.xlsx *.ppt *.pptx"),
+            ("图片文件", "*.png *.jpg *.jpeg *.gif"),
+            ("文档文件", "*.pdf *.doc *.docx *.xls *.xlsx *.ppt *.pptx"),
+            ("所有文件", "*.*")
+        ]
+        filename = filedialog.askopenfilename(
+            title="选择文件",
+            filetypes=file_types
+        )
+        if filename:
+            self.selected_file = filename
+            self.file_label.config(text=f"已选择: {os.path.basename(filename)}")
+
+    def send_message(self, event=None):
+        message = self.message_input.get("1.0", tk.END).strip()
+        if not message:
+            return
+            
+        # 每次发送消息时生成新的user_id
+        user_id = f"user_{int(time.time())}"
+        
+        # 保存消息内容以便失败时恢复
+        self.saved_message = message
+        self.saved_file = self.selected_file
+        
+        # 立即清空输入框和文件选择
+        self.message_input.delete("1.0", tk.END)
+        self.selected_file = None
+        self.file_label.config(text="")
+            
+        # 禁用发送按钮和输入框
+        self.send_btn.config(state='disabled')
+        self.message_input.config(state='disabled')
+        
+        # 显示发送状态
+        self.show_sending_status()
+        
+        # 在聊天显示区域添加用户消息
+        self.chat_display.insert(tk.END, "\n👤 我: ", 'user')
+        self.chat_display.insert(tk.END, f"{message}\n", 'message')
+        if self.saved_file:
+            self.chat_display.insert(tk.END, f"📎 {os.path.basename(self.saved_file)}\n", 'message')
+        self.chat_display.see(tk.END)
+        
+        # 创建新线程发送消息
+        thread = threading.Thread(target=self.send_message_thread, args=(message, user_id, 0))
+        thread.daemon = True
+        thread.start()
+        
+    def send_message_thread(self, message, user_id, retry_count=0):
+        max_retries = 3  # 最大重试次数
+        retry_delay = 2  # 重试延迟（秒）
+        
+        def is_network_error(e):
+            error_str = str(e).lower()
+            return any(text in error_str for text in [
+                'connectionerror',
+                'timeout',
+                'connection refused',
+                'network unreachable',
+                'getaddrinfo failed',
+                'no route to host',
+                'connection reset'
+            ])
+
+        try:
+            print(f"\n尝试发送消息 (第{retry_count + 1}次尝试)")
+            print(f"用户ID: {user_id}")
+            print(f"消息内容: {message}")
+            
+            # 尝试发送消息
+            result = self.api.send_message(
+                bot_id="7447144311730569255",
+                user_id=user_id,
+                message=message,
+                user_name=f"User_{user_id}",
+                file_path=self.saved_file
+            )
+            
+            print("\n接收到API响应:")
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            
+            # 发送成功，更新UI
+            self.root.after(0, self.update_chat_display, result)
+            
+        except Exception as e:
+            print(f"\n发送消息时出错: {str(e)}")
+            print(f"错误类型: {type(e).__name__}")
+            import traceback
+            print("详细错误信息:")
+            print(traceback.format_exc())
+            
+            if retry_count < max_retries and is_network_error(e):
+                # 计算剩余重试次数
+                remaining = max_retries - retry_count
+                
+                # 更新状态消息
+                status_msg = f"网络不稳定，{retry_delay}秒后自动重试... (剩余{remaining}次)"
+                print(f"\n{status_msg}")
+                self.root.after(0, self.update_status, status_msg)
+                
+                # 延迟重试
+                time.sleep(retry_delay)
+                
+                # 递增重试延迟（指数退避）
+                retry_delay *= 1.5
+                
+                # 重试
+                self.send_message_thread(message, user_id, retry_count + 1)
+                return
+            else:
+                print("\n达到最大重试次数或非网络错误，停止重试")
+            
+            # 如果是最后一次重试失败
+            if retry_count == max_retries - 1:
+                error_msg = f"发送失败: {str(e)}"
+                print(f"\n{error_msg}")
+                # 恢复输入内容
+                self.root.after(0, self.restore_failed_message)
+                # 显示友好的错误提示
+                self.root.after(0, self.update_status, error_msg)
+                # 3秒后清除状态消息
+                self.root.after(3000, self.hide_sending_status)
+                # 显示错误对话框
+                self.root.after(0, self.show_error, error_msg)
+        finally:
+            if retry_count == 0:  # 只在最后一次重试后重置UI
+                print("\n重置UI控件状态")
+                self.root.after(0, self.enable_controls)
+
+    def clear_input(self):
+        """清空输入框和相关状态"""
+        self.message_input.delete("1.0", tk.END)
+        self.selected_file = None
+        self.file_label.config(text="")
+        self.saved_message = None
+        self.saved_file = None
+
+    def restore_failed_message(self):
+        """恢复发送失败的消息到输入框"""
+        if hasattr(self, 'saved_message') and self.saved_message:
+            # 删除最后一条未发送成功的消息显示
+            last_line_start = self.chat_display.index("end-2c linestart")
+            self.chat_display.delete(last_line_start, tk.END)
+            
+            # 恢复输入内容
+            self.message_input.delete("1.0", tk.END)
+            self.message_input.insert("1.0", self.saved_message)
+            
+            # 恢复文件选择
+            if hasattr(self, 'saved_file') and self.saved_file:
+                self.selected_file = self.saved_file
+                self.file_label.config(text=f"已选择: {os.path.basename(self.saved_file)}")
+
+    def enable_controls(self):
+        """重新启用控件"""
+        self.send_btn.config(state='normal')
+        self.message_input.config(state='normal')
+        self.message_input.focus_set()  # 将焦点设置回输入框
+
+    def update_status(self, message):
+        """更新状态消息"""
+        if hasattr(self, 'status_label'):
+            self.status_label.destroy()
+        
+        self.status_label = ttk.Label(
+            self.main_frame, 
+            text=message,
+            style='Status.TLabel'  # 使用特殊的状态标签样式
+        )
+        self.status_label.grid(row=1, column=0, sticky=tk.W, padx=5)
+
+    def update_chat_display(self, result):
+        """更新聊天显示区域"""
+        try:
+            print("\n开始更新聊天显示...")
+            if result.get("code") == 0 and "data" in result:
+                messages = result["data"]
+                for msg in messages:
+                    content_type = msg.get("content_type", "")
+                    msg_type = msg.get("type", "")
+                    
+                    # 跳过verbose类型的消息
+                    if msg_type == "verbose":
+                        continue
+                    
+                    if msg_type == "answer" and content_type == "text":
+                        # 显示机器人的文本回答
+                        content = msg.get("content", "")
+                        if content.strip():  # 确保内容不为空
+                            self.chat_display.insert(tk.END, "\n💬 AI助手: ", 'bot')
+                            self.chat_display.insert(tk.END, f"{content}\n", 'message')
+                            print(f"显示AI回复: {content}")
+                    
+                    elif msg_type == "answer" and content_type == "object_string":
+                        # 处理图片消息
+                        try:
+                            content_obj = json.loads(msg.get("content", "[]"))
+                            if isinstance(content_obj, list):
+                                for item in content_obj:
+                                    if item.get("type") == "image" and item.get("url"):
+                                        self.chat_display.insert(tk.END, "\n💬 AI助手: ", 'bot')
+                                        self.chat_display.insert(tk.END, "生成的图片：\n", 'message')
+                                        self.display_image_from_url(item["url"])
+                                        print(f"显示图片: {item['url']}")
+                        except json.JSONDecodeError as e:
+                            print(f"解析图片消息失败: {e}")
+                            print(f"原始消息内容: {msg.get('content')}")
+                            
+                    elif msg_type == "follow_up":
+                        # 显示建议的问题
+                        content = msg.get("content", "")
+                        if content.strip():  # 确保内容不为空
+                            suggestion_start = self.chat_display.index("end-1c")
+                            self.chat_display.insert(tk.END, "  💡 ", 'suggestion')
+                            self.chat_display.insert(tk.END, f"{content}\n", 'suggestion')
+                            suggestion_end = self.chat_display.index("end-1c")
+                            
+                            # 为建议文本添加标签和绑定点击事件
+                            tag_name = f"suggestion_{time.time()}"
+                            self.chat_display.tag_add(tag_name, suggestion_start, suggestion_end)
+                            self.chat_display.tag_bind(tag_name, '<Button-1>', 
+                                                    lambda e, text=content: self.send_suggestion(text))
+                            
+                            # 添加鼠标悬停效果
+                            self.chat_display.tag_config(tag_name, foreground='#0078d4')
+                            self.chat_display.tag_bind(tag_name, '<Enter>', 
+                                                    lambda e: self.chat_display.config(cursor='hand2'))
+                            self.chat_display.tag_bind(tag_name, '<Leave>', 
+                                                    lambda e: self.chat_display.config(cursor=''))
+                            print(f"显示建议: {content}")
+                
+                # 确保滚动到最新消息
+                self.chat_display.see(tk.END)
+                # 发送成功后，清除保存的消息
+                self.saved_message = None
+                self.saved_file = None
+                print("聊天显示更新完成")
+            else:
+                print(f"API响应错误: code={result.get('code')}, msg={result.get('msg')}")
+                
+        except Exception as e:
+            print(f"更新聊天显示时出错: {str(e)}")
+            import traceback
+            print("详细错误信息:")
+            print(traceback.format_exc())
+
+    def send_suggestion(self, suggestion_text):
+        """处理建议消息的点击事件"""
+        # 将建议文本设置到输入框并立即发送
+        self.message_input.delete("1.0", tk.END)
+        self.message_input.insert("1.0", suggestion_text)
+        # 自动发送消息
+        self.send_message()
+
+    def show_error(self, error_message):
+        messagebox.showerror("错误", error_message)
+
+    def display_image_from_url(self, url):
+        try:
+            # 下载图片
+            with self.session.get(url, stream=True) as response:
+                response.raise_for_status()
+                
+                # 创建临时图片文件
+                import tempfile
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            tmp_file.write(chunk)
+                    tmp_file_path = tmp_file.name
+            
+            # 使用PIL打开图片并调整大小
+            image = Image.open(tmp_file_path)
+            # 计算调整后的大小（保持宽高比，最大宽度为400像素）
+            max_width = 400
+            ratio = max_width / image.width
+            new_size = (max_width, int(image.height * ratio))
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+            
+            # 转换为PhotoImage
+            photo = ImageTk.PhotoImage(image)
+            
+            # 在文本框中创建图片标签
+            self.chat_display.image_create(tk.END, image=photo)
+            # 保持对图片的引用（防止被垃圾回收）
+            if not hasattr(self, 'image_refs'):
+                self.image_refs = []
+            self.image_refs.append(photo)
+            
+            # 添加换行
+            self.chat_display.insert(tk.END, "\n")
+            
+            # 删除临时文件
+            os.unlink(tmp_file_path)
+            
+        except Exception as e:
+            print(f"图片显示错误: {str(e)}")
+            self.chat_display.insert(tk.END, f"[图片加载失败: {str(e)}]\n", 'message')
+
+def main():
+    if TkinterDnD:
+        # 如果支持拖放，使用 TkinterDnD.Tk
+        root = TkinterDnD.Tk()
+        # 设置主题
+        style = ttk.Style(root)
+        style.theme_use('clam')
+    else:
+        # 否则使用普通的 Tk
+        root = tk.Tk()
+        style = ttk.Style(root)
+        style.theme_use('clam')
+    
+    app = CozeGUI(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
